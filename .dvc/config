@@ -1,0 +1,4 @@
+[core]
+    remote = onedrive
+['remote "onedrive"']
+    url = webdav://localhost:28888/dvc_data/seg
