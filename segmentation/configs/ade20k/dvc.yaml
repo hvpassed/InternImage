@@ -1,0 +1,59 @@
+stages:
+  train_landcover:
+    cmd: >-
+      CUDA_VISIBLE_DEVICES=1
+      # 1. 运行时动态修改 params.yaml (使用 python 脚本)
+      python update_params.py --data_root data/landcover &&
+      # 2. 启动训练
+      sh dist_train.sh configs/ade20k/exp_dvc.py 1
+      --work-dir work_dirs/exp_landcover
+      --options load_from=pretrained/mask2former_internimage_h_ade20k.pth
+    deps:
+      - configs/ade20k/exp_dvc.py
+      - data/landcover
+      - pretrained/mask2former_internimage_h_ade20k.pth
+      - update_params.py
+    params:
+      - params.yaml:
+        - train_dataset.lr
+        - train_dataset.crop_size
+    outs:
+      - work_dirs/exp_landcover
+
+  train_loveda:
+    cmd: >-
+      CUDA_VISIBLE_DEVICES=1
+      python update_params.py --data_root data/loveDA &&
+      sh dist_train.sh configs/ade20k/exp_dvc.py 1
+      --work-dir work_dirs/exp_loveda
+      --options load_from=pretrained/mask2former_internimage_h_ade20k.pth
+    deps:
+      - configs/ade20k/exp_dvc.py
+      - data/loveDA
+      - pretrained/mask2former_internimage_h_ade20k.pth
+      - update_params.py
+    params:
+      - params.yaml:
+        - train_dataset.lr
+        - train_dataset.crop_size
+    outs:
+      - work_dirs/exp_loveda
+
+  train_combined:
+    cmd: >-
+      CUDA_VISIBLE_DEVICES=1
+      python update_params.py --data_root data/combined &&
+      sh dist_train.sh configs/ade20k/exp_dvc.py 1
+      --work-dir work_dirs/exp_combined
+      --options load_from=pretrained/mask2former_internimage_h_ade20k.pth
+    deps:
+      - configs/ade20k/exp_dvc.py
+      - data/combined
+      - pretrained/mask2former_internimage_h_ade20k.pth
+      - update_params.py
+    params:
+      - params.yaml:
+        - train_dataset.lr
+        - train_dataset.crop_size
+    outs:
+      - work_dirs/exp_combined

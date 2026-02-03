@@ -1,0 +1,6 @@
+train_dataset:
+  data_root: ../../data/landcover  # 默认值 (随便填一个，反正运行时会被覆盖)
+  lr: 0.00001
+  crop_size: 512
+  max_iters: 40000
+  save_interval: 5000
