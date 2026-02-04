@@ -185,6 +185,12 @@ def main():
     # 用 params.yaml 更新配置
     cfg = update_config_with_params(cfg, params, args.dataset)
 
+    # 兼容 lr 被解析为序列的情况
+    if hasattr(cfg, 'optimizer') and isinstance(cfg.optimizer, dict):
+        lr_val = cfg.optimizer.get('lr', None)
+        if isinstance(lr_val, (list, tuple)) and len(lr_val) > 0:
+            cfg.optimizer['lr'] = float(lr_val[0])
+
     # 兼容 mmcv Fp16OptimizerHook 不接受 interval 参数
     if hasattr(cfg, 'optimizer_config') and isinstance(cfg.optimizer_config, dict):
         cfg.optimizer_config.pop('interval', None)
