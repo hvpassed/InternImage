@@ -1,0 +1,5 @@
+outs:
+- md5: f2b27f2628ab7c8a9687d96f8cfa6d42
+  size: 1531723739
+  hash: md5
+  path: internimage_xl_22k_192to384.pth

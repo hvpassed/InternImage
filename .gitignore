@@ -6,7 +6,6 @@ segmentation/convertor/
 detection/convertor/
 checkpoint_dir/
 demo/
-pretrained/
 upload.py
 segmentation/dataset/
 segmentation/data/
@@ -14,3 +13,5 @@ segmentation/ops_dcnv3/build/
 segmentation/ops_dcnv3/DCNv3.egg-info/
 segmentation/ops_dcnv3/dist/
 segmentation/internimage_dvc_training_v2.tar.gz
+segmentation/pretrained/internimage_xl_22k_192to384.pth
+segmentation/pretrained/mask2former_internimage_h_ade20k.pth

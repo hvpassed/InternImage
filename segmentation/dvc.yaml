@@ -12,6 +12,7 @@ stages:
     deps:
       - scripts/train.py
       - configs/mask2former_internimage_h_512_80k_custom5cls.py
+      - pretrained/internimage_xl_22k_192to384.pth
       # - data/${dataset}/.prepared  <-- 已删除这一行，不再强制检查数据
     params:
       - dataset
