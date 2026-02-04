@@ -1,0 +1,6 @@
+outs:
+- md5: a80401fd185b339e16fb987749964b64.dir
+  size: 1021031789
+  nfiles: 21348
+  hash: md5
+  path: landcover

@@ -1,0 +1,6 @@
+outs:
+- md5: c09e6e03a29569165ae82bd253a4c871.dir
+  size: 2528849859
+  nfiles: 29730
+  hash: md5
+  path: combined
