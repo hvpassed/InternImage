@@ -163,3 +163,10 @@ class MaskHungarianAssigner(BaseAssigner):
         assigned_gt_inds[matched_row_inds] = matched_col_inds + 1
         assigned_labels[matched_row_inds] = gt_labels[matched_col_inds]
         return AssignResult(num_gts, assigned_gt_inds, labels=assigned_labels)
+
+
+# 兼容旧配置: type='HungarianAssigner'
+@MASK_ASSIGNERS.register_module(name='HungarianAssigner')
+class HungarianAssigner(MaskHungarianAssigner):
+    """Alias of MaskHungarianAssigner for backward compatibility."""
+    pass

@@ -15,8 +15,9 @@ _base_ = [
 # 类别数量
 num_classes = 5
 
-# 预训练权重 (从ADE20K迁移)
-load_from = 'pretrained/mask2former_internimage_h_ade20k.pth'
+# 预训练权重（骨干）
+pretrained = "pretrained/internimage_xl_22k_192to384.pth"
+load_from = None
 
 # 模型配置
 model = dict(
@@ -25,9 +26,9 @@ model = dict(
         _delete_=True,
         type='InternImage',
         core_op='DCNv3',
-        channels=320,
-        depths=[6, 6, 32, 6],
-        groups=[10, 20, 40, 80],
+        channels=192,
+        depths=[5, 5, 24, 5],
+        groups=[12, 24, 48, 96],
         mlp_ratio=4.,
         drop_path_rate=0.5,
         norm_layer='LN',
@@ -41,9 +42,10 @@ model = dict(
         center_feature_scale=True,   # InternImage-H 特有
         with_cp=False,               # 设为 True 可节省显存
         out_indices=(0, 1, 2, 3),
-        init_cfg=None),
+        init_cfg=dict(type='Pretrained', checkpoint=pretrained)),
     decode_head=dict(
-        in_channels=[320, 640, 1280, 2560],
+        in_channels=[192, 384, 768, 1536],
+        in_index=[0, 1, 2, 3],
         feat_channels=1024,
         out_channels=1024,
         num_classes=num_classes,
@@ -167,9 +169,9 @@ optimizer = dict(
     weight_decay=0.05,
     constructor='CustomLayerDecayOptimizerConstructor',
     paramwise_cfg=dict(
-        num_layers=50, 
+        num_layers=39, 
         layer_decay_rate=0.95,
-        depths=[6, 6, 32, 6], 
+        depths=[5, 5, 24, 5], 
         offset_lr_scale=1.0))
 
 # 学习率配置

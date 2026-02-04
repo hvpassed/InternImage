@@ -675,7 +675,8 @@ class InternImage(nn.Module):
                                                   f'specify `Pretrained` in ' \
                                                   f'`init_cfg` in ' \
                                                   f'{self.__class__.__name__} '
-            ckpt = _load_checkpoint(self.init_cfg.checkpoint,
+            checkpoint = self.init_cfg['checkpoint'] if isinstance(self.init_cfg, dict) else self.init_cfg.checkpoint
+            ckpt = _load_checkpoint(checkpoint,
                                     logger=logger,
                                     map_location='cpu')
             if 'state_dict' in ckpt:

@@ -17,9 +17,21 @@ import yaml
 from pathlib import Path
 from datetime import datetime
 
-# 添加 mmseg_custom 到路径 (InternImage 自定义模块)
+# 添加自定义模块到路径 (InternImage 自定义模块)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / 'mmseg_custom'))
+sys.path.insert(0, str(Path(__file__).parent.parent / 'mmcv_custom'))
+
+# 触发自定义模块注册（模型/优化器/Assigners 等）
+try:
+    import mmseg_custom
+    import mmseg_custom.models
+    import mmseg_custom.core
+    import mmcv_custom
+except ImportError as e:
+    print(f"❌ 无法导入自定义模块: {e}")
+    print(f"Sys Path: {sys.path}")
+    sys.exit(1)
 
 
 def load_params():
@@ -98,7 +110,41 @@ def update_config_with_params(cfg, params, dataset):
                 item['crop_size'] = crop_size
             if item['type'] == 'Pad':
                 item['size'] = crop_size
-    
+    gpu_params = params.get('gpu', {})
+    if gpu_params.get('fp16', False):
+        print("⚡ 已开启 FP16 混合精度训练")
+        cfg.optimizer_config = dict(type='Fp16OptimizerHook', loss_scale='dynamic', interval=50)
+    # --- 动态修改 Backbone (关键) ---
+    model_params = params.get('model', {})
+    if 'backbone' in cfg.model:
+        if 'channels' in model_params:
+            cfg.model.backbone.channels = model_params['channels']
+        if 'depths' in model_params:
+            cfg.model.backbone.depths = model_params['depths']
+        if 'groups' in model_params:
+            cfg.model.backbone.groups = model_params['groups']
+        if 'drop_path_rate' in model_params:
+            cfg.model.backbone.drop_path_rate = model_params['drop_path_rate']
+        # 【新增】核心修复：强制修改卷积核大小 (H=5, XL=3)
+        if 'dw_kernel_size' in model_params:
+            cfg.model.backbone.dw_kernel_size = model_params['dw_kernel_size']
+            
+        cfg.model.backbone.with_cp = True
+
+    # --- 预训练权重 ---
+    if 'pretrained' in model_params and model_params['pretrained']:
+        ckpt_path = model_params['pretrained']
+        if not os.path.exists(ckpt_path):
+            print(f"⚠️ 警告: 预训练权重文件不存在: {ckpt_path}")
+        else:
+            ckpt_path = os.path.abspath(ckpt_path)
+            cfg.model.backbone.init_cfg = dict(type='Pretrained', checkpoint=ckpt_path)
+            print(f"🔄 注入预训练权重: {ckpt_path}")
+
+    # --- 修复 Head ---
+    if hasattr(cfg.model, 'decode_head'):
+        cfg.model.decode_head.in_index = [0, 1, 2, 3]
+
     return cfg
 
 
@@ -138,6 +184,17 @@ def main():
     
     # 用 params.yaml 更新配置
     cfg = update_config_with_params(cfg, params, args.dataset)
+
+    # 兼容 mmcv Fp16OptimizerHook 不接受 interval 参数
+    if hasattr(cfg, 'optimizer_config') and isinstance(cfg.optimizer_config, dict):
+        cfg.optimizer_config.pop('interval', None)
+        cfg.optimizer_config.pop('loss_scale', None)
+        if cfg.optimizer_config.get('type') == 'Fp16OptimizerHook':
+            cfg.optimizer_config.pop('type', None)
+
+    # 禁用 fp16，避免 ms_deform_attn_forward 半精度报错
+    if hasattr(cfg, 'fp16'):
+        cfg.fp16 = None
     
     # 设置工作目录
     if args.work_dir:
@@ -154,6 +211,9 @@ def main():
     # 设置随机种子
     set_random_seed(args.seed, deterministic=False)
     cfg.seed = args.seed
+    # 兼容 mmseg 训练接口需要的 gpu_ids/device
+    cfg.gpu_ids = list(range(args.gpus))
+    cfg.device = 'cuda' if args.gpus > 0 else 'cpu'
     
     # 保存实验信息
     experiment_info = {

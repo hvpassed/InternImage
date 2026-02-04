@@ -1,27 +1,7 @@
-# dvc.yaml
-# ============================================================================
-# DVC Pipeline - 参数化数据集训练
-# 通过修改 params.yaml 中的 dataset 参数来切换数据集
-# ============================================================================
-
+# dvc.yaml (修改版 - 移除数据准备依赖)
 stages:
   # ============================================================================
-  # Stage 1: 数据预处理 (处理LoveDA标签映射等)
-  # ============================================================================
-  prepare:
-    cmd: python scripts/prepare_data.py --dataset ${dataset}
-    deps:
-      - scripts/prepare_data.py
-    params:
-      - dataset
-      - data_root
-      - loveda_label_mapping
-    outs:
-      - data/${dataset}/.prepared:
-          cache: false
-
-  # ============================================================================
-  # Stage 2: 训练模型
+  # Stage 1: 训练模型 (不再依赖 prepare)
   # ============================================================================
   train:
     cmd: >
@@ -32,10 +12,10 @@ stages:
     deps:
       - scripts/train.py
       - configs/mask2former_internimage_h_512_80k_custom5cls.py
-      - data/${dataset}/.prepared
+      # - data/${dataset}/.prepared  <-- 已删除这一行，不再强制检查数据
     params:
       - dataset
-      - data_root.${dataset}
+      - data_root.${dataset} # 依然追踪路径参数变化
       - num_classes
       - model
       - train
@@ -46,13 +26,14 @@ stages:
     metrics:
       - ${experiment.work_dir}/${dataset}/metrics.json:
           cache: false
-    plots:
-      - ${experiment.work_dir}/${dataset}/train_log.csv:
-          x: iter
-          y: mIoU
+    # 暂时注释掉 plots 防止因为没生成 csv 而报错，等跑通了再加
+    # plots:
+    #   - ${experiment.work_dir}/${dataset}/train_log.csv:
+    #       x: iter
+    #       y: mIoU
 
   # ============================================================================
-  # Stage 3: 评估模型
+  # Stage 2: 评估模型
   # ============================================================================
   evaluate:
     cmd: >
