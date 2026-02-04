@@ -13,3 +13,4 @@ segmentation/data/
 segmentation/ops_dcnv3/build/
 segmentation/ops_dcnv3/DCNv3.egg-info/
 segmentation/ops_dcnv3/dist/
+segmentation/internimage_dvc_training_v2.tar.gz

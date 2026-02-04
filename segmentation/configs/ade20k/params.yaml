@@ -1,6 +1,15 @@
-train_dataset:
-  data_root: ../../data/landcover  # 默认值 (随便填一个，反正运行时会被覆盖)
-  lr: 0.00001
+default_dataset: loveDA
+
+train:
   crop_size: 512
+  lr: 1.0e-05
   max_iters: 40000
   save_interval: 5000
+
+datasets:
+  loveDA:
+    data_root: data/loveDA
+  landcover:
+    data_root: data/landcover
+  combined:
+    data_root: data/combined

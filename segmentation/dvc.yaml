@@ -1,0 +1,71 @@
+# dvc.yaml
+# ============================================================================
+# DVC Pipeline - 参数化数据集训练
+# 通过修改 params.yaml 中的 dataset 参数来切换数据集
+# ============================================================================
+
+stages:
+  # ============================================================================
+  # Stage 1: 数据预处理 (处理LoveDA标签映射等)
+  # ============================================================================
+  prepare:
+    cmd: python scripts/prepare_data.py --dataset ${dataset}
+    deps:
+      - scripts/prepare_data.py
+    params:
+      - dataset
+      - data_root
+      - loveda_label_mapping
+    outs:
+      - data/${dataset}/.prepared:
+          cache: false
+
+  # ============================================================================
+  # Stage 2: 训练模型
+  # ============================================================================
+  train:
+    cmd: >
+      python scripts/train.py
+      --config configs/mask2former_internimage_h_512_80k_custom5cls.py
+      --dataset ${dataset}
+      --work-dir ${experiment.work_dir}/${dataset}
+    deps:
+      - scripts/train.py
+      - configs/mask2former_internimage_h_512_80k_custom5cls.py
+      - data/${dataset}/.prepared
+    params:
+      - dataset
+      - data_root.${dataset}
+      - num_classes
+      - model
+      - train
+      - experiment
+    outs:
+      - ${experiment.work_dir}/${dataset}/best_mIoU.pth:
+          cache: false
+    metrics:
+      - ${experiment.work_dir}/${dataset}/metrics.json:
+          cache: false
+    plots:
+      - ${experiment.work_dir}/${dataset}/train_log.csv:
+          x: iter
+          y: mIoU
+
+  # ============================================================================
+  # Stage 3: 评估模型
+  # ============================================================================
+  evaluate:
+    cmd: >
+      python scripts/evaluate.py
+      --config configs/mask2former_internimage_h_512_80k_custom5cls.py
+      --checkpoint ${experiment.work_dir}/${dataset}/best_mIoU.pth
+      --dataset ${dataset}
+    deps:
+      - scripts/evaluate.py
+      - ${experiment.work_dir}/${dataset}/best_mIoU.pth
+    params:
+      - dataset
+      - data_root.${dataset}
+    metrics:
+      - ${experiment.work_dir}/${dataset}/eval_metrics.json:
+          cache: false
