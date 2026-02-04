@@ -75,7 +75,7 @@ train:
   - 512
   optimizer:
     type: AdamW
-    lr: 0.00002
+    lr: 4e-05
     weight_decay: 0.05
     betas:
     - 0.9
