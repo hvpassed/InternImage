@@ -31,6 +31,14 @@ queue_acc() {
         -S train.optimizer.lr=2e-5
 
     dvc exp run --queue \
+        --name "${dataset}_lr6e-5_g${GPUS}_bs${BATCH}_cs416" \
+        -S dataset=${dataset} \
+        -S train.gpus=${GPUS} \
+        -S train.batch_size=${BATCH} \
+        -S "train.crop_size=${CROP}" \
+        -S train.optimizer.lr=6e-5
+
+    dvc exp run --queue \
         --name "${dataset}_nq100_g${GPUS}_bs${BATCH}_cs416" \
         -S dataset=${dataset} \
         -S train.gpus=${GPUS} \

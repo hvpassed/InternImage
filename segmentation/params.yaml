@@ -1,6 +1,6 @@
 # params.yaml (修复版)
 
-dataset: "combined"
+dataset: "landcover"
 
 data_root:
   landcover: data/landcover

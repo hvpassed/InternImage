@@ -5,6 +5,7 @@ stages:
   # ============================================================================
   train:
     cmd: >
+      NCCL_ASYNC_ERROR_HANDLING=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1
       torchrun --nproc_per_node=${train.gpus}
       scripts/train.py
       --config configs/mask2former_internimage_h_512_80k_custom5cls.py
