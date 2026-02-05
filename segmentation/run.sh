@@ -27,8 +27,10 @@ show_help() {
     echo "  train <dataset>       训练模型"
     echo "  eval <dataset>        评估模型"
     echo "  train-dist <dataset> <gpus>  分布式训练"
-    echo "  dvc-train <dataset>   使用DVC训练 (推荐)"
+    echo "  dvc-train <dataset> [gpus]  使用DVC训练 (推荐)"
     echo "  dvc-exp               运行DVC实验"
+    echo "  dvc-queue <dataset> [gpus] [overrides...]  排队DVC实验"
+    echo "  dvc-queue-run          启动并执行队列"
     echo ""
     echo "示例:"
     echo "  bash run.sh prepare loveda"
@@ -74,11 +76,17 @@ evaluate() {
 
 dvc_train() {
     local dataset=$1
+    local gpus=$2
     echo -e "${GREEN}使用DVC训练 - 数据集: $dataset${NC}"
     
     # 更新 params.yaml 中的 dataset 参数
     sed -i "s/^dataset:.*/dataset: \"$dataset\"/" params.yaml
     
+    # 可选：设置多卡数量
+    if [ -n "$gpus" ]; then
+        sed -i "s/^  gpus:.*/  gpus: $gpus/" params.yaml
+    fi
+
     # 运行 DVC pipeline
     dvc repro
 }
@@ -98,6 +106,29 @@ dvc_exp() {
     echo ""
     echo "查看实验结果:"
     echo "  dvc exp show"
+}
+
+dvc_queue() {
+    local dataset=$1
+    local gpus=$2
+    shift 2
+    echo -e "${GREEN}排队DVC实验 - 数据集: $dataset${NC}"
+
+    # 更新 params.yaml 中的 dataset 参数
+    sed -i "s/^dataset:.*/dataset: \"$dataset\"/" params.yaml
+
+    # 可选：设置多卡数量
+    if [ -n "$gpus" ]; then
+        sed -i "s/^  gpus:.*/  gpus: $gpus/" params.yaml
+    fi
+
+    # 追加到队列
+    dvc exp run --queue "$@"
+}
+
+dvc_queue_run() {
+    echo -e "${GREEN}启动DVC队列${NC}"
+    dvc queue start
 }
 
 # 主逻辑
@@ -121,10 +152,17 @@ case "${1:-help}" in
         ;;
     dvc-train)
         [ -z "$2" ] && echo -e "${RED}请指定数据集${NC}" && exit 1
-        dvc_train $2
+        dvc_train $2 $3
         ;;
     dvc-exp)
         dvc_exp
+        ;;
+    dvc-queue)
+        [ -z "$2" ] && echo -e "${RED}请指定数据集${NC}" && exit 1
+        dvc_queue $2 $3 ${@:4}
+        ;;
+    dvc-queue-run)
+        dvc_queue_run
         ;;
     help|--help|-h|*)
         show_help

@@ -1,6 +1,6 @@
 # configs/mask2former_internimage_h_512_80k_custom5cls.py
 """
-InternImage-H + Mask2Former 配置文件
+InternImage-XL + Mask2Former 配置文件
 用于自定义5类语义分割 (应急救灾场景)
 基于官方 mask2former_internimage_h_896_80k_cocostuff2ade20k_ss.py 修改
 """
@@ -30,17 +30,13 @@ model = dict(
         depths=[5, 5, 24, 5],
         groups=[12, 24, 48, 96],
         mlp_ratio=4.,
-        drop_path_rate=0.5,
+        drop_path_rate=0.4,
         norm_layer='LN',
         layer_scale=None,
         offset_scale=1.0,
         post_norm=False,
-        dw_kernel_size=5,           # InternImage-H 特有
-        res_post_norm=True,          # InternImage-H 特有
-        level2_post_norm=True,       # InternImage-H 特有
-        level2_post_norm_block_ids=[5, 11, 17, 23, 29],  # InternImage-H 特有
-        center_feature_scale=True,   # InternImage-H 特有
-        with_cp=False,               # 设为 True 可节省显存
+        dw_kernel_size=3,
+        with_cp=False,               # DDP 下建议关闭
         out_indices=(0, 1, 2, 3),
         init_cfg=dict(type='Pretrained', checkpoint=pretrained)),
     decode_head=dict(
@@ -49,7 +45,7 @@ model = dict(
         feat_channels=1024,
         out_channels=1024,
         num_classes=num_classes,
-        num_queries=100,  # 减少queries数量，因为只有5类
+        num_queries=80,
         pixel_decoder=dict(
             type='MSDeformAttnPixelDecoder',
             num_outs=3,
@@ -126,7 +122,7 @@ model = dict(
 # 图像配置
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
-crop_size = (512, 512)
+crop_size = (416, 416)
 
 # 训练 pipeline
 train_pipeline = [

@@ -1,6 +1,6 @@
 # params.yaml (修复版)
 
-dataset: combined
+dataset: "landcover"
 
 data_root:
   landcover: data/landcover
@@ -40,7 +40,7 @@ loveda_label_mapping:
   6: 2
   7: 0
 
-# 【核心修改】降级为 InternImage-XL
+# InternImage-XL
 model:
   backbone: internimage_xl
   pretrained: pretrained/internimage_xl_22k_192to384.pth
@@ -60,16 +60,18 @@ model:
   dw_kernel_size: 3
 
   drop_path_rate: 0.4
+  with_cp: false
 
 train:
   total_iters: 80000
-  batch_size: 1
+  batch_size: 2
+  gpus: 2
   num_workers: 4
   val_interval: 2000
   checkpoint_interval: 4000
   crop_size:
-  - 512
-  - 512
+  - 416
+  - 416
   img_scale:
   - 2048
   - 512

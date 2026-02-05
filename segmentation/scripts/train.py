@@ -129,7 +129,8 @@ def update_config_with_params(cfg, params, dataset):
         if 'dw_kernel_size' in model_params:
             cfg.model.backbone.dw_kernel_size = model_params['dw_kernel_size']
             
-        cfg.model.backbone.with_cp = True
+        if 'with_cp' in model_params:
+            cfg.model.backbone.with_cp = bool(model_params['with_cp'])
 
     # --- 预训练权重 ---
     if 'pretrained' in model_params and model_params['pretrained']:
@@ -164,7 +165,10 @@ def main():
     parser.add_argument('--work-dir', type=str, default=None, help='工作目录')
     parser.add_argument('--resume-from', type=str, default=None, help='恢复训练的checkpoint')
     parser.add_argument('--no-validate', action='store_true', help='不进行验证')
-    parser.add_argument('--gpus', type=int, default=1, help='GPU数量')
+    parser.add_argument('--gpus', type=int, default=1, help='GPU数量(非分布式)')
+    parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm', 'mpi'],
+                        default='none', help='分布式启动器')
+    parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     args = parser.parse_args()
     
@@ -173,7 +177,7 @@ def main():
     
     # 导入 mmcv 和 mmseg
     from mmcv import Config
-    from mmcv.runner import init_dist, set_random_seed
+    from mmcv.runner import init_dist, set_random_seed, get_dist_info
     from mmseg.apis import train_segmentor
     from mmseg.datasets import build_dataset
     from mmseg.models import build_segmentor
@@ -220,12 +224,33 @@ def main():
     if args.resume_from:
         cfg.resume_from = args.resume_from
     
+    # 初始化分布式环境
+    if 'LOCAL_RANK' not in os.environ:
+        os.environ['LOCAL_RANK'] = str(args.local_rank)
+
+    distributed = args.launcher != 'none'
+    if distributed:
+        dist_params = cfg.get('dist_params', dict(backend='nccl'))
+        init_dist(args.launcher, **dist_params)
+        rank, world_size = get_dist_info()
+        cfg.gpu_ids = list(range(world_size))
+        cfg.device = 'cuda'
+        # Avoid DDP reduction error when some params are unused in a step
+        cfg.find_unused_parameters = True
+        # Avoid reentrant backward issues with checkpointing under DDP
+        if getattr(cfg.model, 'backbone', None) is not None and cfg.model.backbone.get('with_cp', False):
+            if rank == 0:
+                print("⚠️ DDP 下关闭 gradient checkpointing 以避免重复反传错误")
+            cfg.model.backbone.with_cp = False
+    else:
+        rank = 0
+        cfg.gpu_ids = list(range(args.gpus))
+        cfg.device = 'cuda' if args.gpus > 0 else 'cpu'
+
     # 设置随机种子
-    set_random_seed(args.seed, deterministic=False)
-    cfg.seed = args.seed
-    # 兼容 mmseg 训练接口需要的 gpu_ids/device
-    cfg.gpu_ids = list(range(args.gpus))
-    cfg.device = 'cuda' if args.gpus > 0 else 'cpu'
+    seed = args.seed + rank
+    set_random_seed(seed, deterministic=False)
+    cfg.seed = seed
     
     # 保存实验信息
     experiment_info = {
@@ -235,18 +260,20 @@ def main():
         'start_time': datetime.now().isoformat(),
         'params': params
     }
-    with open(Path(cfg.work_dir) / 'experiment_info.json', 'w') as f:
-        json.dump(experiment_info, f, indent=2, default=str)
+    if rank == 0:
+        with open(Path(cfg.work_dir) / 'experiment_info.json', 'w') as f:
+            json.dump(experiment_info, f, indent=2, default=str)
     
     # 打印配置
-    print(f"\n{'='*60}")
-    print(f"训练配置:")
-    print(f"  数据集: {args.dataset}")
-    print(f"  数据路径: {params['data_root'].get(args.dataset)}")
-    print(f"  工作目录: {cfg.work_dir}")
-    print(f"  类别数: {params['num_classes']}")
-    print(f"  类别: {params['classes']}")
-    print(f"{'='*60}\n")
+    if rank == 0:
+        print(f"\n{'='*60}")
+        print(f"训练配置:")
+        print(f"  数据集: {args.dataset}")
+        print(f"  数据路径: {params['data_root'].get(args.dataset)}")
+        print(f"  工作目录: {cfg.work_dir}")
+        print(f"  类别数: {params['num_classes']}")
+        print(f"  类别: {params['classes']}")
+        print(f"{'='*60}\n")
     
     # 构建模型
     model = build_segmentor(
@@ -263,18 +290,19 @@ def main():
         model,
         datasets,
         cfg,
-        distributed=False,
+        distributed=distributed,
         validate=(not args.no_validate),
         meta=dict())
     
     # 保存最终指标
     # 查找 best checkpoint
-    best_ckpt = list(Path(cfg.work_dir).glob('best_mIoU_iter_*.pth'))
-    if best_ckpt:
-        import shutil
-        shutil.copy(best_ckpt[0], Path(cfg.work_dir) / 'best_mIoU.pth')
-    
-    print(f"\n训练完成! 结果保存在: {cfg.work_dir}")
+    if rank == 0:
+        best_ckpt = list(Path(cfg.work_dir).glob('best_mIoU_iter_*.pth'))
+        if best_ckpt:
+            import shutil
+            shutil.copy(best_ckpt[0], Path(cfg.work_dir) / 'best_mIoU.pth')
+
+        print(f"\n训练完成! 结果保存在: {cfg.work_dir}")
 
 
 if __name__ == '__main__':

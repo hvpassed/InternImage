@@ -5,10 +5,12 @@ stages:
   # ============================================================================
   train:
     cmd: >
-      python scripts/train.py
+      torchrun --nproc_per_node=${train.gpus}
+      scripts/train.py
       --config configs/mask2former_internimage_h_512_80k_custom5cls.py
       --dataset ${dataset}
       --work-dir ${experiment.work_dir}/${dataset}
+      --launcher pytorch
     deps:
       - scripts/train.py
       - configs/mask2former_internimage_h_512_80k_custom5cls.py

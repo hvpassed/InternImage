@@ -1,0 +1,5 @@
+outs:
+- md5: 555e97119e292758b112f0a07adab7c1
+  size: 2250962252
+  hash: md5
+  path: internimage_h_jointto22k_384.pth
