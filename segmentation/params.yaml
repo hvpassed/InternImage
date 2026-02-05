@@ -60,6 +60,7 @@ model:
   dw_kernel_size: 3
 
   drop_path_rate: 0.4
+  num_queries: 80
   with_cp: false
 
 train:

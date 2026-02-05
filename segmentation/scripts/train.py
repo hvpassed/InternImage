@@ -110,6 +110,15 @@ def update_config_with_params(cfg, params, dataset):
                 item['crop_size'] = crop_size
             if item['type'] == 'Pad':
                 item['size'] = crop_size
+    # 更新 img_scale
+    if 'img_scale' in train_params:
+        img_scale = tuple(train_params['img_scale'])
+        for item in cfg.data.train.pipeline:
+            if item['type'] == 'Resize':
+                item['img_scale'] = img_scale
+        for item in cfg.data.test.pipeline:
+            if item.get('type') == 'MultiScaleFlipAug':
+                item['img_scale'] = img_scale
     gpu_params = params.get('gpu', {})
     if gpu_params.get('fp16', False):
         print("⚡ 已开启 FP16 混合精度训练")
@@ -125,6 +134,8 @@ def update_config_with_params(cfg, params, dataset):
             cfg.model.backbone.groups = model_params['groups']
         if 'drop_path_rate' in model_params:
             cfg.model.backbone.drop_path_rate = model_params['drop_path_rate']
+        if 'num_queries' in model_params and hasattr(cfg.model, 'decode_head'):
+            cfg.model.decode_head.num_queries = model_params['num_queries']
         # 【新增】核心修复：强制修改卷积核大小 (H=5, XL=3)
         if 'dw_kernel_size' in model_params:
             cfg.model.backbone.dw_kernel_size = model_params['dw_kernel_size']
