@@ -25,11 +25,9 @@ stages:
       - train
       - experiment
     outs:
-      - ${experiment.work_dir}/${dataset}/best_mIoU.pth:
-          cache: false
+      - ${experiment.work_dir}/${dataset}/best_mIoU.pth
     metrics:
-      - ${experiment.work_dir}/${dataset}/metrics.json:
-          cache: false
+      - ${experiment.work_dir}/${dataset}/metrics.json
     # 暂时注释掉 plots 防止因为没生成 csv 而报错，等跑通了再加
     # plots:
     #   - ${experiment.work_dir}/${dataset}/train_log.csv:
@@ -41,7 +39,9 @@ stages:
   # ============================================================================
   evaluate:
     cmd: >
-      python scripts/evaluate.py
+      torchrun --nproc_per_node=${train.gpus}
+      scripts/evaluate.py
+      --launcher pytorch
       --config configs/mask2former_internimage_h_512_80k_custom5cls.py
       --checkpoint ${experiment.work_dir}/${dataset}/best_mIoU.pth
       --dataset ${dataset}
@@ -52,5 +52,4 @@ stages:
       - dataset
       - data_root.${dataset}
     metrics:
-      - ${experiment.work_dir}/${dataset}/eval_metrics.json:
-          cache: false
+      - ${experiment.work_dir}/${dataset}/eval_metrics.json

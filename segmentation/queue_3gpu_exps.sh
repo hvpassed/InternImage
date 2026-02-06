@@ -17,7 +17,7 @@ queue_base() {
         -S train.gpus=${GPUS} \
         -S train.batch_size=${BATCH} \
         -S "train.crop_size=${CROP}" \
-        -S train.optimizer.lr=${BASE_LR}
+    -S train.optimizer.lr=${BASE_LR}
 }
 
 queue_acc() {
@@ -47,12 +47,13 @@ queue_acc() {
         -S model.num_queries=100
 }
 
-queue_base landcover
-queue_base loveda
-queue_base combined
 
-queue_acc landcover
-queue_acc loveda
+queue_base combined
+queue_base loveda
+queue_base landcover
+
 queue_acc combined
+queue_acc loveda
+queue_acc landcover
 
 echo "Queued experiments. Start with: dvc queue start"

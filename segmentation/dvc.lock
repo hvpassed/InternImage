@@ -1,0 +1,105 @@
+schema: '2.0'
+stages:
+  train:
+    cmd: "NCCL_ASYNC_ERROR_HANDLING=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun
+      --nproc_per_node=3 scripts/train.py --config configs/mask2former_internimage_h_512_80k_custom5cls.py
+      --dataset combined --work-dir work_dirs/combined --launcher pytorch\n"
+    deps:
+    - path: configs/mask2former_internimage_h_512_80k_custom5cls.py
+      hash: md5
+      md5: 42498ae4477cbc9dbe885dbfdad22a13
+      size: 6707
+    - path: pretrained/internimage_xl_22k_192to384.pth
+      hash: md5
+      md5: f2b27f2628ab7c8a9687d96f8cfa6d42
+      size: 1531723739
+    - path: scripts/train.py
+      hash: md5
+      md5: accb813baa993ed2fa6e85bb632396ab
+      size: 14377
+    params:
+      params.yaml:
+        data_root.combined: data/combined
+        dataset: combined
+        experiment:
+          name: mask2former_internimage_xl_5cls
+          seed: 42
+          work_dir: work_dirs
+        model:
+          backbone: internimage_xl
+          pretrained: pretrained/internimage_xl_22k_192to384.pth
+          channels: 192
+          depths:
+          - 5
+          - 5
+          - 24
+          - 5
+          groups:
+          - 12
+          - 24
+          - 48
+          - 96
+          dw_kernel_size: 3
+          drop_path_rate: 0.4
+          num_queries: 80
+          with_cp: false
+        num_classes: 5
+        train:
+          total_iters: 50
+          batch_size: 2
+          gpus: 3
+          num_workers: 4
+          master_port: 29502
+          val_interval: 50
+          checkpoint_interval: 100
+          crop_size:
+          - 416
+          - 416
+          img_scale:
+          - 2048
+          - 512
+          optimizer:
+            type: AdamW
+            lr: 4e-05
+            weight_decay: 0.05
+            betas:
+            - 0.9
+            - 0.999
+          lr_config:
+            policy: poly
+            power: 1.0
+            min_lr: 0.0
+            warmup: linear
+            warmup_iters: 1500
+            warmup_ratio: 1e-06
+          layer_decay_rate: 0.95
+    outs:
+    - path: work_dirs/combined/best_mIoU.pth
+      hash: md5
+      md5: 8b471fa35496ee8bc9d7296205e49a5a
+      size: 6804375098
+    - path: work_dirs/combined/metrics.json
+      hash: md5
+      md5: 0c865d857e101b9cfe7431ac0a960297
+      size: 106
+  evaluate:
+    cmd: "python scripts/evaluate.py --config configs/mask2former_internimage_h_512_80k_custom5cls.py
+      --checkpoint work_dirs/combined/best_mIoU.pth --dataset combined\n"
+    deps:
+    - path: scripts/evaluate.py
+      hash: md5
+      md5: 9cf1ef81c4fff017a3c28b6b252f0cc5
+      size: 4813
+    - path: work_dirs/combined/best_mIoU.pth
+      hash: md5
+      md5: 8b471fa35496ee8bc9d7296205e49a5a
+      size: 6804375098
+    params:
+      params.yaml:
+        data_root.combined: data/combined
+        dataset: combined
+    outs:
+    - path: work_dirs/combined/eval_metrics.json
+      hash: md5
+      md5: 7a9aa506b90f9ec9ea4d56e1e0999214
+      size: 276

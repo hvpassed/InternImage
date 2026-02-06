@@ -1,6 +1,6 @@
 # params.yaml (修复版)
 
-dataset: "landcover"
+dataset: combined
 
 data_root:
   landcover: data/landcover
@@ -64,12 +64,13 @@ model:
   with_cp: false
 
 train:
-  total_iters: 80000
+  total_iters: 50
   batch_size: 2
-  gpus: 2
+  gpus: 3
   num_workers: 4
-  val_interval: 2000
-  checkpoint_interval: 4000
+  master_port: 29502
+  val_interval: 50
+  checkpoint_interval: 100
   crop_size:
   - 416
   - 416

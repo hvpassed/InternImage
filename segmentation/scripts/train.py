@@ -14,6 +14,7 @@ import sys
 import argparse
 import json
 import yaml
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -35,8 +36,9 @@ except ImportError as e:
 
 
 def load_params():
-    """加载 params.yaml"""
-    params_file = Path('params.yaml')
+    """加载 params.yaml 或 PARAMS_FILE 指定的参数文件"""
+    params_path = os.environ.get('PARAMS_FILE', 'params.yaml')
+    params_file = Path(params_path)
     if params_file.exists():
         with open(params_file, 'r') as f:
             return yaml.safe_load(f)
@@ -165,6 +167,65 @@ def save_metrics(work_dir, metrics):
     metrics_file = Path(work_dir) / 'metrics.json'
     with open(metrics_file, 'w') as f:
         json.dump(metrics, f, indent=2)
+
+
+def extract_metrics_from_log(work_dir):
+    """从最新日志中解析 best mIoU / aAcc / mAcc"""
+    log_files = sorted(Path(work_dir).glob('*.log'), key=lambda p: p.stat().st_mtime, reverse=True)
+    json_logs = sorted(Path(work_dir).glob('*.log.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not log_files and not json_logs:
+        return {}
+
+    best_miou = None
+    best_iter = None
+    last_aacc = None
+    last_miou = None
+    last_macc = None
+
+    best_pattern = re.compile(r"Best mIoU is ([0-9.]+) at (\d+) iter")
+    val_pattern = re.compile(r"aAcc: ([0-9.]+), mIoU: ([0-9.]+), mAcc: ([0-9.]+)")
+
+    if log_files:
+        with log_files[0].open('r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                match_best = best_pattern.search(line)
+                if match_best:
+                    best_miou = float(match_best.group(1))
+                    best_iter = int(match_best.group(2))
+                match_val = val_pattern.search(line)
+                if match_val:
+                    last_aacc = float(match_val.group(1))
+                    last_miou = float(match_val.group(2))
+                    last_macc = float(match_val.group(3))
+    elif json_logs:
+        with json_logs[0].open('r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get('mode') == 'val':
+                    last_aacc = record.get('aAcc', last_aacc)
+                    last_miou = record.get('mIoU', last_miou)
+                    last_macc = record.get('mAcc', last_macc)
+
+    metrics = {}
+    if best_miou is not None:
+        metrics['best_mIoU'] = best_miou
+    if best_iter is not None:
+        metrics['best_iter'] = best_iter
+    if last_aacc is not None:
+        metrics['aAcc'] = last_aacc
+    if last_miou is not None:
+        metrics['mIoU'] = last_miou
+    if last_macc is not None:
+        metrics['mAcc'] = last_macc
+
+    if log_files:
+        metrics['log_file'] = str(log_files[0])
+    elif json_logs:
+        metrics['log_file'] = str(json_logs[0])
+    return metrics
 
 
 def main():
@@ -312,6 +373,9 @@ def main():
         if best_ckpt:
             import shutil
             shutil.copy(best_ckpt[0], Path(cfg.work_dir) / 'best_mIoU.pth')
+
+        metrics = extract_metrics_from_log(cfg.work_dir)
+        save_metrics(cfg.work_dir, metrics)
 
         print(f"\n训练完成! 结果保存在: {cfg.work_dir}")
 
