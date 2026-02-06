@@ -107,6 +107,9 @@ def main():
         rank = 0
     
     # 计算指标
+    if rank != 0:
+        return
+
     eval_results = dataset.evaluate(results, metric='mIoU')
     
     # 保存结果
@@ -123,22 +126,20 @@ def main():
                      for i in range(params['num_classes'])}
     }
     
-    if rank == 0:
-        with open(eval_file, 'w') as f:
-            json.dump(metrics, f, indent=2)
+    with open(eval_file, 'w') as f:
+        json.dump(metrics, f, indent=2)
     
     # 打印结果
-    if rank == 0:
-        print(f"\n{'='*60}")
-        print(f"评估结果 - {args.dataset}")
-        print(f"{'='*60}")
-        print(f"mIoU: {metrics['mIoU']:.4f}")
-        print(f"mAcc: {metrics['mAcc']:.4f}")
-        print(f"aAcc: {metrics['aAcc']:.4f}")
-        print(f"\n类别 IoU:")
-        for cls_name, iou in metrics['class_IoU'].items():
-            print(f"  {cls_name}: {iou:.4f}")
-        print(f"\n结果已保存: {eval_file}")
+    print(f"\n{'='*60}")
+    print(f"评估结果 - {args.dataset}")
+    print(f"{'='*60}")
+    print(f"mIoU: {metrics['mIoU']:.4f}")
+    print(f"mAcc: {metrics['mAcc']:.4f}")
+    print(f"aAcc: {metrics['aAcc']:.4f}")
+    print(f"\n类别 IoU:")
+    for cls_name, iou in metrics['class_IoU'].items():
+        print(f"  {cls_name}: {iou:.4f}")
+    print(f"\n结果已保存: {eval_file}")
 
 
 if __name__ == '__main__':
