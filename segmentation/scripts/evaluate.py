@@ -94,11 +94,16 @@ def main():
             model.cuda(),
             device_ids=[int(os.environ['LOCAL_RANK'])],
             broadcast_buffers=False)
-        results = multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False)
+        results = multi_gpu_test(
+            model,
+            data_loader,
+            tmpdir=None,
+            gpu_collect=False,
+            pre_eval=True)
         rank, _ = get_dist_info()
     else:
         model = MMDataParallel(model, device_ids=args.gpu_ids)
-        results = single_gpu_test(model, data_loader)
+        results = single_gpu_test(model, data_loader, pre_eval=True)
         rank = 0
     
     # 计算指标
