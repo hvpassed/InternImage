@@ -1,0 +1,6 @@
+{
+  "aAcc": 0.8634,
+  "mIoU": 0.6552,
+  "mAcc": 0.7597,
+  "log_file": "work_dirs/combined/None.log.json"
+}

@@ -27,4 +27,8 @@ segmentation/internimage_dvc_training_v2.tar.gz
 segmentation/pretrained/internimage_xl_22k_192to384.pth
 segmentation/pretrained/mask2former_internimage_h_ade20k.pth
 loveda.tar.gz
-segmentation/predict_dir/
+*.png
+*.zip
+*.JPG
+*.pth
+*.h5

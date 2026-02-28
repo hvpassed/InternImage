@@ -1,0 +1,125 @@
+{
+  "dataset": "loveda",
+  "config": "configs/mask2former_internimage_h_512_80k_custom5cls.py",
+  "data_root": "data/loveDA",
+  "start_time": "2026-02-06T01:56:53.203972",
+  "params": {
+    "dataset": "loveda",
+    "data_root": {
+      "landcover": "data/landcover",
+      "loveda": "data/loveDA",
+      "combined": "data/combined"
+    },
+    "num_classes": 5,
+    "classes": [
+      "background",
+      "building",
+      "woodland",
+      "water",
+      "road"
+    ],
+    "palette": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        255,
+        0,
+        0
+      ],
+      [
+        0,
+        255,
+        0
+      ],
+      [
+        0,
+        0,
+        255
+      ],
+      [
+        255,
+        255,
+        0
+      ]
+    ],
+    "loveda_label_mapping": {
+      "0": 255,
+      "1": 0,
+      "2": 1,
+      "3": 4,
+      "4": 3,
+      "5": 0,
+      "6": 2,
+      "7": 0
+    },
+    "model": {
+      "backbone": "internimage_xl",
+      "pretrained": "pretrained/internimage_xl_22k_192to384.pth",
+      "channels": 192,
+      "depths": [
+        5,
+        5,
+        24,
+        5
+      ],
+      "groups": [
+        12,
+        24,
+        48,
+        96
+      ],
+      "dw_kernel_size": 3,
+      "drop_path_rate": 0.4,
+      "num_queries": 80,
+      "with_cp": false
+    },
+    "train": {
+      "total_iters": 80000,
+      "batch_size": 2,
+      "gpus": 3,
+      "num_workers": 4,
+      "val_interval": 2000,
+      "checkpoint_interval": 4000,
+      "crop_size": [
+        416,
+        416
+      ],
+      "img_scale": [
+        2048,
+        512
+      ],
+      "optimizer": {
+        "type": "AdamW",
+        "lr": "4e-05",
+        "weight_decay": 0.05,
+        "betas": [
+          0.9,
+          0.999
+        ]
+      },
+      "lr_config": {
+        "policy": "poly",
+        "power": 1.0,
+        "min_lr": 0.0,
+        "warmup": "linear",
+        "warmup_iters": 1500,
+        "warmup_ratio": 1e-06
+      },
+      "layer_decay_rate": 0.95
+    },
+    "experiment": {
+      "name": "mask2former_internimage_xl_5cls",
+      "seed": 42,
+      "work_dir": "work_dirs"
+    },
+    "gpu": {
+      "ids": [
+        0
+      ],
+      "fp16": true
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "dataset": "combined",
+  "checkpoint": "work_dirs/combined/best_mIoU.pth",
+  "mIoU": 0.6568999999999999,
+  "mAcc": 0.7628,
+  "aAcc": 0.8640000000000001,
+  "class_IoU": {
+    "background": 0.8241999816894531,
+    "building": 0.5897999954223633,
+    "woodland": 0.6837000274658203,
+    "water": 0.6381999969482421,
+    "road": 0.5486999893188477
+  }
+}

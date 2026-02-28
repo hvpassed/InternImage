@@ -45,13 +45,13 @@ stages:
           with_cp: false
         num_classes: 5
         train:
-          total_iters: 50
+          total_iters: 80000
           batch_size: 2
           gpus: 3
           num_workers: 4
           master_port: 29502
-          val_interval: 50
-          checkpoint_interval: 100
+          val_interval: 500
+          checkpoint_interval: 1000
           crop_size:
           - 416
           - 416
@@ -76,24 +76,25 @@ stages:
     outs:
     - path: work_dirs/combined/best_mIoU.pth
       hash: md5
-      md5: 8b471fa35496ee8bc9d7296205e49a5a
-      size: 6804375098
+      md5: e0c6e1490a4a1dd90563e38e0e4d402b
+      size: 6804378490
     - path: work_dirs/combined/metrics.json
       hash: md5
-      md5: 0c865d857e101b9cfe7431ac0a960297
+      md5: 892833849f6d32df6c9adc8ee0a35fb1
       size: 106
   evaluate:
-    cmd: "python scripts/evaluate.py --config configs/mask2former_internimage_h_512_80k_custom5cls.py
-      --checkpoint work_dirs/combined/best_mIoU.pth --dataset combined\n"
+    cmd: "torchrun --nproc_per_node=3 scripts/evaluate.py --launcher pytorch --config
+      configs/mask2former_internimage_h_512_80k_custom5cls.py --checkpoint work_dirs/combined/best_mIoU.pth
+      --dataset combined\n"
     deps:
     - path: scripts/evaluate.py
       hash: md5
-      md5: 9cf1ef81c4fff017a3c28b6b252f0cc5
-      size: 4813
+      md5: 72e4103b93583711ae83e221cecb007c
+      size: 4854
     - path: work_dirs/combined/best_mIoU.pth
       hash: md5
-      md5: 8b471fa35496ee8bc9d7296205e49a5a
-      size: 6804375098
+      md5: e0c6e1490a4a1dd90563e38e0e4d402b
+      size: 6804378490
     params:
       params.yaml:
         data_root.combined: data/combined
@@ -101,5 +102,5 @@ stages:
     outs:
     - path: work_dirs/combined/eval_metrics.json
       hash: md5
-      md5: 7a9aa506b90f9ec9ea4d56e1e0999214
-      size: 276
+      md5: 7d789ef6ad3e367c4e694bad07cbd4bf
+      size: 353
