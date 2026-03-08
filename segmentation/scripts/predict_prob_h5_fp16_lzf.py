@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Predict segmentation probabilities for images listed in imgRef and save to H5.
+
+True-batch version:
+- Reuse MMSeg test pipeline
+- Real batch collate + scatter (not single-image scatter then torch.cat)
+- Group by same input tensor shape + same target output size
+- Optional AMP(fp16) inference
+- Resize on GPU (default optional) for speed
+- H5 supports lzf/gzip/none compression
+- H5 supports float16/float32 saving
+- Optional overlay/label export
+- Auto fallback to single-image inference if a batch fails
+- Handle missing images by writing zero-probability maps
+"""
+
+import argparse
+import os
+import sys
+import time
+from contextlib import nullcontext
+from pathlib import Path
+
+import cv2
+import h5py
+import mmcv
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import yaml
+from mmcv.parallel import collate, scatter
+from mmcv.runner import load_checkpoint
+from mmseg.apis import init_segmentor
+from mmseg.datasets.pipelines import Compose
+from tqdm import tqdm
+
+
+# Add custom modules to path and register
+sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "mmseg_custom"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "mmcv_custom"))
+
+try:
+    import mmseg_custom  # noqa: F401
+    import mmseg_custom.models  # noqa: F401
+    import mmseg_custom.core  # noqa: F401
+    import mmcv_custom  # noqa: F401
+except ImportError as e:
+    print(f"❌ 无法导入自定义模块: {e}")
+    print(f"Sys Path: {sys.path}")
+    raise
+
+
+class LoadImage:
+    """A simple pipeline to load image."""
+
+    def __call__(self, results):
+        if isinstance(results["img"], str):
+            results["filename"] = results["img"]
+            results["ori_filename"] = results["img"]
+        else:
+            results["filename"] = None
+            results["ori_filename"] = None
+
+        img = mmcv.imread(results["img"])
+        if img is None:
+            raise FileNotFoundError(f"无法读取图片: {results['img']}")
+
+        results["img"] = img
+        results["img_shape"] = img.shape
+        results["ori_shape"] = img.shape
+        return results
+
+
+def load_params(params_path):
+    if not params_path:
+        return {}
+    if not os.path.exists(params_path):
+        return {}
+    with open(params_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return data if data is not None else {}
+
+
+def resolve_image_path(name, img_dir):
+    name_path = Path(name)
+    if name_path.is_absolute() and name_path.exists():
+        return name_path
+
+    candidate = img_dir / name_path
+    if candidate.exists():
+        return candidate
+
+    candidate = img_dir / name_path.name
+    if candidate.exists():
+        return candidate
+
+    return None
+
+
+def load_imgref(imgref_path):
+    try:
+        df = pd.read_csv(imgref_path, sep=None, engine="python")
+    except Exception:
+        try:
+            df = pd.read_csv(imgref_path, sep=",")
+        except Exception:
+            df = pd.read_csv(imgref_path, header=None)
+
+    columns = {str(c).lower(): c for c in df.columns}
+
+    if "name" in columns and "id" in columns:
+        name_col = columns["name"]
+        id_col = columns["id"]
+        width_col = columns.get("width", columns.get("w"))
+        height_col = columns.get("height", columns.get("h"))
+        return df, name_col, id_col, width_col, height_col
+
+    df = pd.read_csv(imgref_path, sep=None, engine="python", header=None)
+    if df.shape[1] < 2:
+        raise ValueError("imgRef.txt 至少需要两列: Name 和 ID")
+
+    name_col = 0
+    id_col = 1
+    width_col = 2 if df.shape[1] > 2 else None
+    height_col = 3 if df.shape[1] > 3 else None
+    return df, name_col, id_col, width_col, height_col
+
+
+def get_num_classes(model):
+    vis_model = model.module if hasattr(model, "module") else model
+
+    if hasattr(vis_model, "decode_head") and hasattr(vis_model.decode_head, "num_classes"):
+        return int(vis_model.decode_head.num_classes)
+
+    if hasattr(model, "CLASSES") and model.CLASSES is not None:
+        return len(model.CLASSES)
+
+    return int(model.cfg.model.decode_head.num_classes)
+
+
+def prepare_test_pipeline(model):
+    cfg = model.cfg
+    test_pipeline = [LoadImage()] + cfg.data.test.pipeline[1:]
+    return Compose(test_pipeline)
+
+
+def get_save_dtype(dtype_name):
+    dtype_name = dtype_name.lower()
+    if dtype_name == "float16":
+        return np.float16, torch.float16
+    if dtype_name == "float32":
+        return np.float32, torch.float32
+    raise ValueError(f"不支持的 save dtype: {dtype_name}")
+
+
+def create_h5_dataset(h5f, key, array, compression):
+    kwargs = {}
+    if compression is not None and compression.lower() != "none":
+        kwargs["compression"] = compression
+        kwargs["shuffle"] = True
+    h5f.create_dataset(str(key), data=array, **kwargs)
+
+
+def maybe_cuda_sync(model):
+    if next(model.parameters()).is_cuda:
+        torch.cuda.synchronize()
+
+
+def get_autocast_context(enabled):
+    if enabled and torch.cuda.is_available():
+        return torch.cuda.amp.autocast(enabled=True)
+    return nullcontext()
+
+
+def get_free_mem_gb(device):
+    if not torch.cuda.is_available():
+        return None
+    try:
+        free_mem, total_mem = torch.cuda.mem_get_info(torch.device(device))
+        return free_mem / 1024**3, total_mem / 1024**3
+    except Exception:
+        return None
+
+
+def print_cuda_mem(prefix, device):
+    mem = get_free_mem_gb(device)
+    if mem is not None:
+        free_mem, total_mem = mem
+        print(f"{prefix} free={free_mem:.2f} GB / total={total_mem:.2f} GB")
+
+
+def resize_prob_cpu(prob_np, target_width, target_height):
+    resized = [
+        cv2.resize(channel, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+        for channel in prob_np
+    ]
+    return np.stack(resized, axis=0)
+
+
+def unwrap_first_tensor(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj
+    if hasattr(obj, "data"):
+        return unwrap_first_tensor(obj.data)
+    if isinstance(obj, (list, tuple)):
+        for x in obj:
+            t = unwrap_first_tensor(x)
+            if isinstance(t, torch.Tensor):
+                return t
+    return None
+
+
+def normalize_img_metas_for_encode_decode(img_metas):
+    obj = img_metas
+
+    while hasattr(obj, "data"):
+        obj = obj.data
+
+    # 常见情况：
+    # 1) [list_of_dict] -> 取第一个
+    # 2) [[dict, ...]]  -> 展平一层
+    # 3) list_of_dict   -> 直接返回
+    while isinstance(obj, (list, tuple)) and len(obj) == 1:
+        first = obj[0]
+        if isinstance(first, dict):
+            break
+        obj = first
+        while hasattr(obj, "data"):
+            obj = obj.data
+
+    if isinstance(obj, tuple):
+        obj = list(obj)
+
+    if isinstance(obj, list) and (len(obj) == 0 or isinstance(obj[0], dict)):
+        return obj
+
+    raise TypeError(f"无法解析 img_metas 结构: type={type(obj)}")
+
+
+def prepare_sample_cpu(test_pipeline, img_path):
+    data = dict(img=img_path)
+    data = test_pipeline(data)
+    return data
+
+
+def get_sample_input_hw(sample):
+    img_tensor = unwrap_first_tensor(sample["img"])
+    if not isinstance(img_tensor, torch.Tensor):
+        raise TypeError("无法从 sample['img'] 中提取张量")
+    return int(img_tensor.shape[-2]), int(img_tensor.shape[-1])
+
+
+def build_batch_data(model, batch_items):
+    samples = [item["sample"] for item in batch_items]
+    data = collate(samples, samples_per_gpu=len(samples))
+
+    if next(model.parameters()).is_cuda:
+        data = scatter(data, [next(model.parameters()).device])[0]
+
+    img_tensor = unwrap_first_tensor(data["img"])
+    if not isinstance(img_tensor, torch.Tensor):
+        raise TypeError("无法从 batch data['img'] 中提取张量")
+
+    img_metas = normalize_img_metas_for_encode_decode(data["img_metas"])
+    return img_tensor, img_metas
+
+
+def infer_batch(
+    model,
+    batch_items,
+    amp_enabled,
+    gpu_resize,
+    torch_save_dtype,
+):
+    batch_tensor, img_metas = build_batch_data(model, batch_items)
+
+    with torch.inference_mode():
+        with get_autocast_context(amp_enabled):
+            seg_logit = model.encode_decode(batch_tensor, img_metas)
+
+            if seg_logit.dim() == 2:
+                seg_logit = seg_logit.unsqueeze(0).unsqueeze(0)
+            elif seg_logit.dim() == 3:
+                if len(batch_items) == 1:
+                    seg_logit = seg_logit.unsqueeze(0)
+                else:
+                    raise RuntimeError(
+                        f"批量推理返回 3 维张量，无法安全判断维度含义: shape={tuple(seg_logit.shape)}"
+                    )
+
+            if seg_logit.dim() != 4:
+                raise RuntimeError(f"模型输出维度异常: shape={tuple(seg_logit.shape)}")
+
+            if gpu_resize:
+                target_h = batch_items[0]["target_height"]
+                target_w = batch_items[0]["target_width"]
+                if target_h is not None and target_w is not None:
+                    seg_logit = F.interpolate(
+                        seg_logit,
+                        size=(target_h, target_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+            prob_t = torch.softmax(seg_logit, dim=1)
+
+    maybe_cuda_sync(model)
+    prob_np = prob_t.to(torch_save_dtype).cpu().numpy()
+
+    outputs = []
+    for i, item in enumerate(batch_items):
+        one_prob = prob_np[i]
+
+        if not gpu_resize:
+            target_w = item["target_width"]
+            target_h = item["target_height"]
+            if target_w is not None and target_h is not None:
+                one_prob = resize_prob_cpu(one_prob, target_w, target_h)
+
+        outputs.append(one_prob)
+
+    return outputs
+
+
+def save_visualization(vis_model, model, out_label_dir, img_path, image_id, prob, opacity, target_width, target_height):
+    pred = prob.argmax(axis=0).astype(np.uint8)
+
+    label_path = out_label_dir / f"{image_id}_label.png"
+    cv2.imwrite(str(label_path), pred)
+
+    palette = getattr(model, "PALETTE", None)
+    if palette is not None:
+        img_show = mmcv.imread(str(img_path))
+        if img_show is not None:
+            if target_width is not None and target_height is not None:
+                img_show = cv2.resize(
+                    img_show,
+                    (target_width, target_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+            overlay = vis_model.show_result(
+                img_show,
+                [pred],
+                palette=palette,
+                show=False,
+                opacity=opacity,
+            )
+            overlay_path = out_label_dir / f"{image_id}_overlay.png"
+            cv2.imwrite(str(overlay_path), overlay)
+
+
+def flush_batch(
+    h5f,
+    model,
+    batch_items,
+    stats,
+    vis_model,
+    out_label_dir,
+    opacity,
+    compression,
+    torch_save_dtype,
+    np_save_dtype,
+    amp_enabled,
+    gpu_resize,
+    raise_on_single_fail=False,
+):
+    if not batch_items:
+        return
+
+    t_infer = time.perf_counter()
+    try:
+        probs = infer_batch(
+            model=model,
+            batch_items=batch_items,
+            amp_enabled=amp_enabled,
+            gpu_resize=gpu_resize,
+            torch_save_dtype=torch_save_dtype,
+        )
+    except Exception as e:
+        if len(batch_items) > 1:
+            ids = [str(x["image_id"]) for x in batch_items]
+            print(f"⚠️ 批量推理失败，退回逐张处理。IDs={ids} | error={e}")
+            for item in batch_items:
+                flush_batch(
+                    h5f=h5f,
+                    model=model,
+                    batch_items=[item],
+                    stats=stats,
+                    vis_model=vis_model,
+                    out_label_dir=out_label_dir,
+                    opacity=opacity,
+                    compression=compression,
+                    torch_save_dtype=torch_save_dtype,
+                    np_save_dtype=np_save_dtype,
+                    amp_enabled=amp_enabled,
+                    gpu_resize=gpu_resize,
+                    raise_on_single_fail=raise_on_single_fail,
+                )
+            return
+        else:
+            item = batch_items[0]
+            msg = f"❌ 单张推理失败: {item['img_path']} (ID: {item['image_id']}) -> {e}"
+            print(msg)
+            stats["skipped"] += 1
+            if raise_on_single_fail:
+                raise
+            return
+
+    stats["infer"] += time.perf_counter() - t_infer
+
+    for item, prob in zip(batch_items, probs):
+        t_h5 = time.perf_counter()
+        create_h5_dataset(
+            h5f,
+            item["image_id"],
+            prob.astype(np_save_dtype, copy=False),
+            compression,
+        )
+        stats["h5"] += time.perf_counter() - t_h5
+
+        if out_label_dir:
+            t_viz = time.perf_counter()
+            try:
+                save_visualization(
+                    vis_model=vis_model,
+                    model=model,
+                    out_label_dir=out_label_dir,
+                    img_path=item["img_path"],
+                    image_id=item["image_id"],
+                    prob=prob,
+                    opacity=opacity,
+                    target_width=item["target_width"],
+                    target_height=item["target_height"],
+                )
+            except Exception as e:
+                print(f"⚠️ 可视化失败: {item['img_path']} (ID: {item['image_id']}) -> {e}")
+            stats["viz"] += time.perf_counter() - t_viz
+
+        stats["count"] += 1
+
+
+def write_probabilities_h5(
+    model,
+    img_dir,
+    imgref_path,
+    out_h5_path,
+    out_label_dir=None,
+    opacity=0.5,
+    compression="lzf",
+    save_dtype="float16",
+    amp=False,
+    log_every=50,
+    batch_size=4,
+    gpu_resize=True,
+    raise_on_single_fail=False,
+):
+    df, name_col, id_col, width_col, height_col = load_imgref(imgref_path)
+    records = df.to_dict("records")
+
+    img_dir = Path(img_dir)
+    out_h5_path = Path(out_h5_path)
+    out_h5_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_label_dir:
+        out_label_dir = Path(out_label_dir)
+        out_label_dir.mkdir(parents=True, exist_ok=True)
+
+    vis_model = model.module if hasattr(model, "module") else model
+    num_classes = get_num_classes(model)
+    np_save_dtype, torch_save_dtype = get_save_dtype(save_dtype)
+
+    model.eval()
+    torch.backends.cudnn.benchmark = True
+    test_pipeline = prepare_test_pipeline(model)
+    use_cuda = next(model.parameters()).is_cuda
+    amp_enabled = bool(amp and use_cuda)
+
+    print(f"📌 类别数: {num_classes}")
+    print(f"📌 保存精度: {save_dtype}")
+    print(f"📌 H5 压缩: {compression}")
+    print(f"📌 AMP 推理: {'开启' if amp_enabled else '关闭'}")
+    print(f"📌 GPU resize: {'开启' if gpu_resize else '关闭'}")
+    print(f"📌 输出可视化: {'开启' if out_label_dir else '关闭'}")
+    print(f"📌 批量大小: {batch_size}")
+
+    stats = {
+        "prep": 0.0,
+        "infer": 0.0,
+        "h5": 0.0,
+        "viz": 0.0,
+        "count": 0,
+        "missing": 0,
+        "skipped": 0,
+    }
+
+    current_batch = []
+    current_batch_key = None
+
+    def flush_current():
+        nonlocal current_batch, current_batch_key
+        if current_batch:
+            flush_batch(
+                h5f=h5f,
+                model=model,
+                batch_items=current_batch,
+                stats=stats,
+                vis_model=vis_model,
+                out_label_dir=out_label_dir,
+                opacity=opacity,
+                compression=compression,
+                torch_save_dtype=torch_save_dtype,
+                np_save_dtype=np_save_dtype,
+                amp_enabled=amp_enabled,
+                gpu_resize=gpu_resize,
+                raise_on_single_fail=raise_on_single_fail,
+            )
+            current_batch = []
+            current_batch_key = None
+
+    with h5py.File(str(out_h5_path), "w") as h5f:
+        pbar = tqdm(records, total=len(records), desc="Infer")
+
+        for idx, row in enumerate(pbar):
+            image_name = row[name_col]
+            image_id = row[id_col]
+            img_path = resolve_image_path(str(image_name), img_dir)
+
+            target_width, target_height = None, None
+            if width_col is not None and height_col is not None:
+                try:
+                    target_width = int(row[width_col])
+                    target_height = int(row[height_col])
+                except Exception:
+                    target_width, target_height = None, None
+
+            if img_path is None:
+                flush_current()
+                print(f"⚠️ 找不到图片: {image_name} (ID: {image_id}) -> 生成全黑预测占位")
+                stats["missing"] += 1
+
+                if target_width is not None and target_height is not None:
+                    prob = np.zeros((num_classes, target_height, target_width), dtype=np_save_dtype)
+                    t_h5 = time.perf_counter()
+                    create_h5_dataset(h5f, image_id, prob, compression)
+                    stats["h5"] += time.perf_counter() - t_h5
+                else:
+                    print(f"❌ 错误: ID {image_id} 图片缺失且 imgRef 中没有宽高信息，跳过。")
+                    stats["skipped"] += 1
+                continue
+
+            t0 = time.perf_counter()
+            try:
+                sample = prepare_sample_cpu(test_pipeline, str(img_path))
+                input_h, input_w = get_sample_input_hw(sample)
+            except Exception as e:
+                flush_current()
+                print(f"❌ 预处理失败: {img_path} (ID: {image_id}) -> {e}")
+                stats["skipped"] += 1
+                continue
+            stats["prep"] += time.perf_counter() - t0
+
+            batch_key = (input_h, input_w, target_height, target_width)
+
+            if current_batch and batch_key != current_batch_key:
+                flush_current()
+
+            item = {
+                "image_id": image_id,
+                "image_name": image_name,
+                "img_path": str(img_path),
+                "sample": sample,
+                "target_width": target_width,
+                "target_height": target_height,
+            }
+
+            current_batch.append(item)
+            current_batch_key = batch_key
+
+            if len(current_batch) >= batch_size:
+                flush_current()
+
+            if log_every > 0 and (idx + 1) % log_every == 0:
+                n = max(stats["count"], 1)
+                mem = get_free_mem_gb(next(model.parameters()).device) if use_cuda else None
+                mem_str = ""
+                if mem is not None:
+                    free_mem, total_mem = mem
+                    mem_str = f", free_mem={free_mem:.2f}/{total_mem:.2f}GB"
+
+                print(
+                    f"[{idx + 1}/{len(records)}] "
+                    f"prep={stats['prep']/n:.4f}s/img, "
+                    f"infer={stats['infer']/n:.4f}s/img, "
+                    f"h5={stats['h5']/n:.4f}s/img, "
+                    f"viz={stats['viz']/n:.4f}s/img"
+                    f"{mem_str}"
+                )
+
+        flush_current()
+
+    n = max(stats["count"], 1)
+    print("\n========== 性能统计 ==========")
+    print(f"成功处理图片数: {stats['count']}")
+    print(f"缺失图片数: {stats['missing']}")
+    print(f"跳过图片数: {stats['skipped']}")
+    print(f"平均预处理耗时: {stats['prep']/n:.4f} s/img")
+    print(f"平均推理耗时:   {stats['infer']/n:.4f} s/img")
+    print(f"平均H5写入耗时: {stats['h5']/n:.4f} s/img")
+    print(f"平均可视化耗时: {stats['viz']/n:.4f} s/img")
+    print("================================")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Predict segmentation probabilities and save to H5 (true batch optimized)"
+    )
+    parser.add_argument("--config", required=True, help="Config file")
+    parser.add_argument("--checkpoint", required=True, help="Checkpoint .pth")
+    parser.add_argument("--img-dir", required=True, help="Input image directory")
+    parser.add_argument("--imgref", required=True, help="imgRef.txt path")
+    parser.add_argument("--out-h5", required=True, help="Output h5 path")
+    parser.add_argument("--out-label-dir", default=None, help="Output label/overlay dir")
+    parser.add_argument("--device", default="cuda:0", help="Device")
+    parser.add_argument("--opacity", type=float, default=0.5, help="Overlay opacity")
+    parser.add_argument("--params", default="params.yaml", help="Params yaml")
+
+    parser.add_argument(
+        "--compression",
+        default="lzf",
+        choices=["lzf", "gzip", "none"],
+        help="H5 compression method",
+    )
+    parser.add_argument(
+        "--save-dtype",
+        default="float16",
+        choices=["float16", "float32"],
+        help="H5 save dtype",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable AMP(fp16) inference on CUDA",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Batch size for same-shape images",
+    )
+    parser.add_argument(
+        "--gpu-resize",
+        action="store_true",
+        help="Resize logits on GPU before softmax/save",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=50,
+        help="Print average timing every N images",
+    )
+    parser.add_argument(
+        "--raise-on-single-fail",
+        action="store_true",
+        help="Raise exception if even single-image inference fails",
+    )
+
+    args = parser.parse_args()
+
+    img_dir = Path(args.img_dir)
+    if not img_dir.exists():
+        print(f"❌ 输入目录不存在: {img_dir}")
+        return
+
+    if not os.path.exists(args.imgref):
+        print(f"❌ imgRef 不存在: {args.imgref}")
+        return
+
+    print_cuda_mem("🚀 Before init_segmentor:", args.device)
+    model = init_segmentor(args.config, checkpoint=None, device=args.device)
+    print_cuda_mem("🚀 After init_segmentor:", args.device)
+
+    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
+
+    params = load_params(args.params)
+    palette = params.get("palette", getattr(model, "PALETTE", None))
+    classes = params.get("classes", getattr(model, "CLASSES", None))
+
+    if isinstance(checkpoint, dict):
+        meta = checkpoint.get("meta", {})
+        if "CLASSES" in meta:
+            classes = meta["CLASSES"]
+        if "PALETTE" in meta:
+            palette = meta["PALETTE"]
+
+    if classes is not None:
+        model.CLASSES = classes
+    if palette is not None:
+        model.PALETTE = palette
+
+    compression = None if args.compression == "none" else args.compression
+
+    print(f"📂 使用 imgRef: {args.imgref}")
+    print(f"💾 概率将保存至: {args.out_h5}")
+
+    write_probabilities_h5(
+        model=model,
+        img_dir=img_dir,
+        imgref_path=args.imgref,
+        out_h5_path=args.out_h5,
+        out_label_dir=args.out_label_dir,
+        opacity=args.opacity,
+        compression=compression,
+        save_dtype=args.save_dtype,
+        amp=args.amp,
+        log_every=args.log_every,
+        batch_size=max(1, args.batch_size),
+        gpu_resize=args.gpu_resize,
+        raise_on_single_fail=args.raise_on_single_fail,
+    )
+
+    print("✅ 概率保存完成。")
+
+
+if __name__ == "__main__":
+    main()
