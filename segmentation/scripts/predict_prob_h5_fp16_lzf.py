@@ -4,16 +4,15 @@
 """
 Predict segmentation probabilities for images listed in imgRef and save to H5.
 
-True-batch version:
+Async pipeline version:
 - Reuse MMSeg test pipeline
-- Real batch collate + scatter (not single-image scatter then torch.cat)
-- Group by same input tensor shape + same target output size
+- Real batch collate + scatter
+- CPU preprocessing thread pool
+- Single async H5 writer thread (safe for one-file serial writes)
+- Keep LZF compression for fast downstream reads
 - Optional AMP(fp16) inference
-- Resize on GPU (default optional) for speed
-- H5 supports lzf/gzip/none compression
-- H5 supports float16/float32 saving
-- Optional overlay/label export
-- Auto fallback to single-image inference if a batch fails
+- Optional GPU resize
+- Optional label / overlay export
 - Handle missing images by writing zero-probability maps
 """
 
@@ -21,6 +20,10 @@ import argparse
 import os
 import sys
 import time
+import queue
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -158,14 +161,6 @@ def get_save_dtype(dtype_name):
     raise ValueError(f"不支持的 save dtype: {dtype_name}")
 
 
-def create_h5_dataset(h5f, key, array, compression):
-    kwargs = {}
-    if compression is not None and compression.lower() != "none":
-        kwargs["compression"] = compression
-        kwargs["shuffle"] = True
-    h5f.create_dataset(str(key), data=array, **kwargs)
-
-
 def maybe_cuda_sync(model):
     if next(model.parameters()).is_cuda:
         torch.cuda.synchronize()
@@ -221,10 +216,6 @@ def normalize_img_metas_for_encode_decode(img_metas):
     while hasattr(obj, "data"):
         obj = obj.data
 
-    # 常见情况：
-    # 1) [list_of_dict] -> 取第一个
-    # 2) [[dict, ...]]  -> 展平一层
-    # 3) list_of_dict   -> 直接返回
     while isinstance(obj, (list, tuple)) and len(obj) == 1:
         first = obj[0]
         if isinstance(first, dict):
@@ -270,13 +261,7 @@ def build_batch_data(model, batch_items):
     return img_tensor, img_metas
 
 
-def infer_batch(
-    model,
-    batch_items,
-    amp_enabled,
-    gpu_resize,
-    torch_save_dtype,
-):
+def infer_batch(model, batch_items, amp_enabled, gpu_resize, torch_save_dtype):
     batch_tensor, img_metas = build_batch_data(model, batch_items)
 
     with torch.inference_mode():
@@ -315,134 +300,149 @@ def infer_batch(
     outputs = []
     for i, item in enumerate(batch_items):
         one_prob = prob_np[i]
-
         if not gpu_resize:
             target_w = item["target_width"]
             target_h = item["target_height"]
             if target_w is not None and target_h is not None:
                 one_prob = resize_prob_cpu(one_prob, target_w, target_h)
-
         outputs.append(one_prob)
 
     return outputs
 
 
-def save_visualization(vis_model, model, out_label_dir, img_path, image_id, prob, opacity, target_width, target_height):
+def build_color_mask(pred, palette):
+    h, w = pred.shape
+    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+    for cls_id, color in enumerate(palette):
+        color_mask[pred == cls_id] = color[:3]
+    return color_mask
+
+
+def save_visualization_simple(out_label_dir, img_path, image_id, prob, opacity, target_width, target_height, palette):
     pred = prob.argmax(axis=0).astype(np.uint8)
 
     label_path = out_label_dir / f"{image_id}_label.png"
     cv2.imwrite(str(label_path), pred)
 
-    palette = getattr(model, "PALETTE", None)
-    if palette is not None:
-        img_show = mmcv.imread(str(img_path))
-        if img_show is not None:
-            if target_width is not None and target_height is not None:
-                img_show = cv2.resize(
-                    img_show,
-                    (target_width, target_height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-
-            overlay = vis_model.show_result(
-                img_show,
-                [pred],
-                palette=palette,
-                show=False,
-                opacity=opacity,
-            )
-            overlay_path = out_label_dir / f"{image_id}_overlay.png"
-            cv2.imwrite(str(overlay_path), overlay)
-
-
-def flush_batch(
-    h5f,
-    model,
-    batch_items,
-    stats,
-    vis_model,
-    out_label_dir,
-    opacity,
-    compression,
-    torch_save_dtype,
-    np_save_dtype,
-    amp_enabled,
-    gpu_resize,
-    raise_on_single_fail=False,
-):
-    if not batch_items:
+    if palette is None:
         return
 
-    t_infer = time.perf_counter()
-    try:
-        probs = infer_batch(
-            model=model,
-            batch_items=batch_items,
-            amp_enabled=amp_enabled,
-            gpu_resize=gpu_resize,
-            torch_save_dtype=torch_save_dtype,
+    img_show = mmcv.imread(str(img_path))
+    if img_show is None:
+        return
+
+    if target_width is not None and target_height is not None:
+        img_show = cv2.resize(
+            img_show,
+            (target_width, target_height),
+            interpolation=cv2.INTER_LINEAR,
         )
-    except Exception as e:
-        if len(batch_items) > 1:
-            ids = [str(x["image_id"]) for x in batch_items]
-            print(f"⚠️ 批量推理失败，退回逐张处理。IDs={ids} | error={e}")
-            for item in batch_items:
-                flush_batch(
-                    h5f=h5f,
-                    model=model,
-                    batch_items=[item],
-                    stats=stats,
-                    vis_model=vis_model,
-                    out_label_dir=out_label_dir,
-                    opacity=opacity,
-                    compression=compression,
-                    torch_save_dtype=torch_save_dtype,
-                    np_save_dtype=np_save_dtype,
-                    amp_enabled=amp_enabled,
-                    gpu_resize=gpu_resize,
-                    raise_on_single_fail=raise_on_single_fail,
-                )
-            return
-        else:
-            item = batch_items[0]
-            msg = f"❌ 单张推理失败: {item['img_path']} (ID: {item['image_id']}) -> {e}"
-            print(msg)
-            stats["skipped"] += 1
-            if raise_on_single_fail:
-                raise
-            return
 
-    stats["infer"] += time.perf_counter() - t_infer
+    color_mask = build_color_mask(pred, palette)
+    overlay = cv2.addWeighted(img_show, 1.0 - opacity, color_mask, opacity, 0.0)
 
-    for item, prob in zip(batch_items, probs):
-        t_h5 = time.perf_counter()
-        create_h5_dataset(
-            h5f,
-            item["image_id"],
-            prob.astype(np_save_dtype, copy=False),
-            compression,
-        )
-        stats["h5"] += time.perf_counter() - t_h5
+    overlay_path = out_label_dir / f"{image_id}_overlay.png"
+    cv2.imwrite(str(overlay_path), overlay)
 
-        if out_label_dir:
-            t_viz = time.perf_counter()
+
+def create_h5_dataset(h5f, key, array, compression):
+    kwargs = {}
+    if compression is not None and compression.lower() != "none":
+        kwargs["compression"] = compression
+        kwargs["shuffle"] = True
+    h5f.create_dataset(str(key), data=array, **kwargs)
+
+
+def writer_thread_main(
+    out_h5_path,
+    task_queue,
+    compression,
+    out_label_dir,
+    opacity,
+    palette,
+    writer_stats,
+):
+    if out_label_dir:
+        out_label_dir.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(str(out_h5_path), "w") as h5f:
+        while True:
+            task = task_queue.get()
+            if task is None:
+                task_queue.task_done()
+                break
+
             try:
-                save_visualization(
-                    vis_model=vis_model,
-                    model=model,
-                    out_label_dir=out_label_dir,
-                    img_path=item["img_path"],
-                    image_id=item["image_id"],
-                    prob=prob,
-                    opacity=opacity,
-                    target_width=item["target_width"],
-                    target_height=item["target_height"],
+                t0 = time.perf_counter()
+                create_h5_dataset(
+                    h5f,
+                    task["image_id"],
+                    task["prob"],
+                    compression,
                 )
-            except Exception as e:
-                print(f"⚠️ 可视化失败: {item['img_path']} (ID: {item['image_id']}) -> {e}")
-            stats["viz"] += time.perf_counter() - t_viz
+                writer_stats["h5"] += time.perf_counter() - t0
 
-        stats["count"] += 1
+                if out_label_dir:
+                    t1 = time.perf_counter()
+                    save_visualization_simple(
+                        out_label_dir=out_label_dir,
+                        img_path=task["img_path"],
+                        image_id=task["image_id"],
+                        prob=task["prob"],
+                        opacity=opacity,
+                        target_width=task["target_width"],
+                        target_height=task["target_height"],
+                        palette=palette,
+                    )
+                    writer_stats["viz"] += time.perf_counter() - t1
+
+                writer_stats["written"] += 1
+
+            except Exception as e:
+                writer_stats["errors"] += 1
+                print(f"⚠️ Writer 处理失败: ID={task.get('image_id')} -> {e}")
+
+            finally:
+                task_queue.task_done()
+
+
+def preprocess_record(record, name_col, id_col, width_col, height_col, img_dir, test_pipeline):
+    image_name = record[name_col]
+    image_id = record[id_col]
+    img_path = resolve_image_path(str(image_name), img_dir)
+
+    target_width, target_height = None, None
+    if width_col is not None and height_col is not None:
+        try:
+            target_width = int(record[width_col])
+            target_height = int(record[height_col])
+        except Exception:
+            target_width, target_height = None, None
+
+    if img_path is None:
+        return {
+            "status": "missing",
+            "image_id": image_id,
+            "image_name": image_name,
+            "img_path": None,
+            "target_width": target_width,
+            "target_height": target_height,
+        }
+
+    sample = prepare_sample_cpu(test_pipeline, str(img_path))
+    input_h, input_w = get_sample_input_hw(sample)
+    batch_key = (input_h, input_w, target_height, target_width)
+
+    return {
+        "status": "ok",
+        "image_id": image_id,
+        "image_name": image_name,
+        "img_path": str(img_path),
+        "target_width": target_width,
+        "target_height": target_height,
+        "sample": sample,
+        "batch_key": batch_key,
+    }
 
 
 def write_probabilities_h5(
@@ -456,9 +456,12 @@ def write_probabilities_h5(
     save_dtype="float16",
     amp=False,
     log_every=50,
-    batch_size=4,
+    batch_size=12,
     gpu_resize=True,
     raise_on_single_fail=False,
+    preprocess_workers=4,
+    prefetch_size=32,
+    writer_queue_size=64,
 ):
     df, name_col, id_col, width_col, height_col = load_imgref(imgref_path)
     records = df.to_dict("records")
@@ -469,9 +472,9 @@ def write_probabilities_h5(
 
     if out_label_dir:
         out_label_dir = Path(out_label_dir)
-        out_label_dir.mkdir(parents=True, exist_ok=True)
 
     vis_model = model.module if hasattr(model, "module") else model
+    _ = vis_model  # 保留变量，便于后续扩展
     num_classes = get_num_classes(model)
     np_save_dtype, torch_save_dtype = get_save_dtype(save_dtype)
 
@@ -480,6 +483,7 @@ def write_probabilities_h5(
     test_pipeline = prepare_test_pipeline(model)
     use_cuda = next(model.parameters()).is_cuda
     amp_enabled = bool(amp and use_cuda)
+    palette = getattr(model, "PALETTE", None)
 
     print(f"📌 类别数: {num_classes}")
     print(f"📌 保存精度: {save_dtype}")
@@ -488,104 +492,163 @@ def write_probabilities_h5(
     print(f"📌 GPU resize: {'开启' if gpu_resize else '关闭'}")
     print(f"📌 输出可视化: {'开启' if out_label_dir else '关闭'}")
     print(f"📌 批量大小: {batch_size}")
+    print(f"📌 预处理线程数: {preprocess_workers}")
+    print(f"📌 预取窗口: {prefetch_size}")
+    print(f"📌 Writer 队列大小: {writer_queue_size}")
 
     stats = {
         "prep": 0.0,
         "infer": 0.0,
-        "h5": 0.0,
-        "viz": 0.0,
         "count": 0,
         "missing": 0,
         "skipped": 0,
     }
+    writer_stats = {
+        "h5": 0.0,
+        "viz": 0.0,
+        "written": 0,
+        "errors": 0,
+    }
+
+    task_queue = queue.Queue(maxsize=writer_queue_size)
+    writer_thread = threading.Thread(
+        target=writer_thread_main,
+        args=(out_h5_path, task_queue, compression, out_label_dir, opacity, palette, writer_stats),
+        daemon=True,
+    )
+    writer_thread.start()
 
     current_batch = []
     current_batch_key = None
 
+    def enqueue_write_task(item, prob):
+        task_queue.put({
+            "image_id": item["image_id"],
+            "img_path": item["img_path"],
+            "prob": prob.astype(np_save_dtype, copy=False),
+            "target_width": item["target_width"],
+            "target_height": item["target_height"],
+        })
+
+    def flush_batch(batch_items):
+        if not batch_items:
+            return
+
+        t_infer = time.perf_counter()
+        try:
+            probs = infer_batch(
+                model=model,
+                batch_items=batch_items,
+                amp_enabled=amp_enabled,
+                gpu_resize=gpu_resize,
+                torch_save_dtype=torch_save_dtype,
+            )
+        except Exception as e:
+            if len(batch_items) > 1:
+                ids = [str(x["image_id"]) for x in batch_items]
+                print(f"⚠️ 批量推理失败，退回逐张处理。IDs={ids} | error={e}")
+                for item in batch_items:
+                    flush_batch([item])
+                return
+            else:
+                item = batch_items[0]
+                print(f"❌ 单张推理失败: {item['img_path']} (ID: {item['image_id']}) -> {e}")
+                stats["skipped"] += 1
+                if raise_on_single_fail:
+                    raise
+                return
+
+        stats["infer"] += time.perf_counter() - t_infer
+
+        for item, prob in zip(batch_items, probs):
+            enqueue_write_task(item, prob)
+            stats["count"] += 1
+
     def flush_current():
         nonlocal current_batch, current_batch_key
         if current_batch:
-            flush_batch(
-                h5f=h5f,
-                model=model,
-                batch_items=current_batch,
-                stats=stats,
-                vis_model=vis_model,
-                out_label_dir=out_label_dir,
-                opacity=opacity,
-                compression=compression,
-                torch_save_dtype=torch_save_dtype,
-                np_save_dtype=np_save_dtype,
-                amp_enabled=amp_enabled,
-                gpu_resize=gpu_resize,
-                raise_on_single_fail=raise_on_single_fail,
-            )
+            flush_batch(current_batch)
             current_batch = []
             current_batch_key = None
 
-    with h5py.File(str(out_h5_path), "w") as h5f:
-        pbar = tqdm(records, total=len(records), desc="Infer")
+    pending = deque()
 
-        for idx, row in enumerate(pbar):
-            image_name = row[name_col]
-            image_id = row[id_col]
-            img_path = resolve_image_path(str(image_name), img_dir)
+    def submit_record(executor, rec):
+        t0 = time.perf_counter()
+        fut = executor.submit(
+            preprocess_record,
+            rec,
+            name_col,
+            id_col,
+            width_col,
+            height_col,
+            img_dir,
+            test_pipeline,
+        )
+        pending.append((fut, t0))
 
-            target_width, target_height = None, None
-            if width_col is not None and height_col is not None:
-                try:
-                    target_width = int(row[width_col])
-                    target_height = int(row[height_col])
-                except Exception:
-                    target_width, target_height = None, None
+    with ThreadPoolExecutor(max_workers=max(1, preprocess_workers)) as executor:
+        rec_iter = iter(records)
 
-            if img_path is None:
-                flush_current()
-                print(f"⚠️ 找不到图片: {image_name} (ID: {image_id}) -> 生成全黑预测占位")
-                stats["missing"] += 1
-
-                if target_width is not None and target_height is not None:
-                    prob = np.zeros((num_classes, target_height, target_width), dtype=np_save_dtype)
-                    t_h5 = time.perf_counter()
-                    create_h5_dataset(h5f, image_id, prob, compression)
-                    stats["h5"] += time.perf_counter() - t_h5
-                else:
-                    print(f"❌ 错误: ID {image_id} 图片缺失且 imgRef 中没有宽高信息，跳过。")
-                    stats["skipped"] += 1
-                continue
-
-            t0 = time.perf_counter()
+        for _ in range(min(prefetch_size, len(records))):
             try:
-                sample = prepare_sample_cpu(test_pipeline, str(img_path))
-                input_h, input_w = get_sample_input_hw(sample)
+                submit_record(executor, next(rec_iter))
+            except StopIteration:
+                break
+
+        pbar = tqdm(total=len(records), desc="Infer")
+        processed_records = 0
+
+        while pending:
+            fut, t0 = pending.popleft()
+
+            try:
+                item = fut.result()
+                stats["prep"] += time.perf_counter() - t0
             except Exception as e:
                 flush_current()
-                print(f"❌ 预处理失败: {img_path} (ID: {image_id}) -> {e}")
+                print(f"❌ 预处理失败 -> {e}")
                 stats["skipped"] += 1
+                processed_records += 1
+                pbar.update(1)
+                try:
+                    submit_record(executor, next(rec_iter))
+                except StopIteration:
+                    pass
                 continue
-            stats["prep"] += time.perf_counter() - t0
 
-            batch_key = (input_h, input_w, target_height, target_width)
+            processed_records += 1
+            pbar.update(1)
 
-            if current_batch and batch_key != current_batch_key:
+            if item["status"] == "missing":
                 flush_current()
+                print(f"⚠️ 找不到图片: {item['image_name']} (ID: {item['image_id']}) -> 生成全黑预测占位")
+                stats["missing"] += 1
 
-            item = {
-                "image_id": image_id,
-                "image_name": image_name,
-                "img_path": str(img_path),
-                "sample": sample,
-                "target_width": target_width,
-                "target_height": target_height,
-            }
+                if item["target_width"] is not None and item["target_height"] is not None:
+                    zero_prob = np.zeros(
+                        (num_classes, item["target_height"], item["target_width"]),
+                        dtype=np_save_dtype,
+                    )
+                    enqueue_write_task(item, zero_prob)
+                    stats["count"] += 1
+                else:
+                    print(f"❌ 错误: ID {item['image_id']} 图片缺失且 imgRef 中没有宽高信息，跳过。")
+                    stats["skipped"] += 1
 
-            current_batch.append(item)
-            current_batch_key = batch_key
+            else:
+                batch_key = item["batch_key"]
 
-            if len(current_batch) >= batch_size:
-                flush_current()
+                if current_batch and batch_key != current_batch_key:
+                    flush_current()
 
-            if log_every > 0 and (idx + 1) % log_every == 0:
+                current_batch.append(item)
+                current_batch_key = batch_key
+
+                if len(current_batch) >= batch_size:
+                    flush_current()
+
+            if log_every > 0 and processed_records % log_every == 0:
                 n = max(stats["count"], 1)
                 mem = get_free_mem_gb(next(model.parameters()).device) if use_cuda else None
                 mem_str = ""
@@ -594,31 +657,45 @@ def write_probabilities_h5(
                     mem_str = f", free_mem={free_mem:.2f}/{total_mem:.2f}GB"
 
                 print(
-                    f"[{idx + 1}/{len(records)}] "
+                    f"[{processed_records}/{len(records)}] "
                     f"prep={stats['prep']/n:.4f}s/img, "
                     f"infer={stats['infer']/n:.4f}s/img, "
-                    f"h5={stats['h5']/n:.4f}s/img, "
-                    f"viz={stats['viz']/n:.4f}s/img"
+                    f"h5={writer_stats['h5']/max(writer_stats['written'], 1):.4f}s/img, "
+                    f"viz={writer_stats['viz']/max(writer_stats['written'], 1):.4f}s/img"
                     f"{mem_str}"
                 )
 
-        flush_current()
+            try:
+                submit_record(executor, next(rec_iter))
+            except StopIteration:
+                pass
+
+        pbar.close()
+
+    flush_current()
+
+    task_queue.put(None)
+    task_queue.join()
+    writer_thread.join()
 
     n = max(stats["count"], 1)
+    wn = max(writer_stats["written"], 1)
     print("\n========== 性能统计 ==========")
-    print(f"成功处理图片数: {stats['count']}")
+    print(f"成功提交图片数: {stats['count']}")
+    print(f"Writer 实际写入数: {writer_stats['written']}")
     print(f"缺失图片数: {stats['missing']}")
     print(f"跳过图片数: {stats['skipped']}")
+    print(f"Writer 错误数: {writer_stats['errors']}")
     print(f"平均预处理耗时: {stats['prep']/n:.4f} s/img")
     print(f"平均推理耗时:   {stats['infer']/n:.4f} s/img")
-    print(f"平均H5写入耗时: {stats['h5']/n:.4f} s/img")
-    print(f"平均可视化耗时: {stats['viz']/n:.4f} s/img")
+    print(f"平均H5写入耗时: {writer_stats['h5']/wn:.4f} s/img")
+    print(f"平均可视化耗时: {writer_stats['viz']/wn:.4f} s/img")
     print("================================")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Predict segmentation probabilities and save to H5 (true batch optimized)"
+        description="Predict segmentation probabilities and save to H5 (async preprocess + async writer)"
     )
     parser.add_argument("--config", required=True, help="Config file")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint .pth")
@@ -650,7 +727,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
+        default=12,
         help="Batch size for same-shape images",
     )
     parser.add_argument(
@@ -668,6 +745,24 @@ def main():
         "--raise-on-single-fail",
         action="store_true",
         help="Raise exception if even single-image inference fails",
+    )
+    parser.add_argument(
+        "--preprocess-workers",
+        type=int,
+        default=4,
+        help="Number of CPU preprocessing worker threads",
+    )
+    parser.add_argument(
+        "--prefetch-size",
+        type=int,
+        default=32,
+        help="How many records to preprocess ahead",
+    )
+    parser.add_argument(
+        "--writer-queue-size",
+        type=int,
+        default=64,
+        help="Max pending H5 write tasks",
     )
 
     args = parser.parse_args()
@@ -722,6 +817,9 @@ def main():
         batch_size=max(1, args.batch_size),
         gpu_resize=args.gpu_resize,
         raise_on_single_fail=args.raise_on_single_fail,
+        preprocess_workers=max(1, args.preprocess_workers),
+        prefetch_size=max(1, args.prefetch_size),
+        writer_queue_size=max(1, args.writer_queue_size),
     )
 
     print("✅ 概率保存完成。")

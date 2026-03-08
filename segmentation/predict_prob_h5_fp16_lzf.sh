@@ -26,7 +26,9 @@ python scripts/predict_prob_h5_fp16_lzf.py \
   --out-h5 ${OUTPUT_DIR}/mat_fp16_lzf.h5 \
   --device ${DEVICE} \
   --save-dtype float16 \
-  --compression none \
+  --compression lzf \
   --batch-size 12 \
-  --gpu-resize
-  #--amp
+  --gpu-resize \
+  --preprocess-workers 4 \
+  --prefetch-size 32 \
+  --writer-queue-size 64
